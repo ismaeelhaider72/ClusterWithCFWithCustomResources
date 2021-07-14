@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description:  This template deploys an ECS cluster with custom resources 
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  InstanceType:
+    Description: Which instance type should we use to build the ECS cluster?
+    Type: String
+    Default: t2.micro
+
+  ClusterSize:
+    Description: How many ECS hosts do you want to initially deploy?
+    Type: Number
+    Default: 1
+
+
+  Subnets:
+    Description: Choose which subnets this ECS cluster should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+
+  SecurityGroup:
+    Description: Select the Security Group to use for the ECS cluster hosts
+    Type: AWS::EC2::SecurityGroup::Id
+  KeyPair:
+    Description: Amazon EC2 Key Pair
+    Type: AWS::EC2::KeyPair::KeyName    
+
+  ECSAMI:
+    Description: ECS-Optimized AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+# The following parameter name format retrieves the image ID of the latest stable Amazon ECS-optimized Amazon Linux 2 AMI by using the sub-parameter image_id.    
+    Default: /aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id
+
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EnvironmentName
+
+
+
+
+  CustomResourceFunction:
+    DependsOn: ECSAutoScalingGroup
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Role: !GetAtt 'CustomResourceRole.Arn'
+      Handler: index.lambda_handler
+      Runtime: python3.7 
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import urllib3
+          import json          
+          import boto3
+          # import time
+
+          client = boto3.client('ecs')
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          # We create a PoolManager to generate a request. It handles all of the details of connection pooling and thread safety.
+          http = urllib3.PoolManager()
+
+          def lambda_handler(event, context):
+            responseData = {}
+            responseData['Data'] = 'failure custom message'
+         
+            presponse = client.run_task(
+
+                cluster=event['ResourceProperties']['ClusterId'],
+                count=1,
+                launchType=event['ResourceProperties']['LaunchType'],               
+                taskDefinition=event['ResourceProperties']['TaskDefinition']
+            )
+            # time.sleep(20)
+
+            def send(event, context, responseStatus, responseData, presponse, physicalResourceId=None, noEcho=False, reason=None):
+                responseUrl = event['ResponseURL']
+
+                print(responseUrl)  
+                responseBody = {
+                    'Status' : responseStatus,
+                    'Reason' : "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                    'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                    'StackId' : event['StackId'],
+                    'RequestId' : event['RequestId'],
+                    'LogicalResourceId' : event['LogicalResourceId'],
+                    'NoEcho' : noEcho,
+                    'Data' : responseData
+                }
+
+                if(responseStatus == 'FAILED'):
+                  responseBody['Reason' ]=str(presponse['failures'][0]['reason'])
+
+                else: 
+                  json_responseBody = json.dumps(responseBody)
+
+                  print("Response body:")
+                  print(json_responseBody)
+
+                  headers = { 
+                      'content-type' : '',
+                      'content-length' : str(len(json_responseBody))
+                  }
+
+                  try:
+                      response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                      print("Status code:", response.status)
+
+
+                  except Exception as e:
+
+                      print("send(..) failed executing http.request(..):", e)
+
+            print("response is ", presponse)
+            if presponse['failures'] == []:
+              send(event, context, SUCCESS, responseData, presponse)        
+            else:
+              send(event, context, FAILED, responseData,presponse)         
+
+            
+
+                      
+
+
+
+
+
+  SumResource:
+    Type: "Custom::Summer"
+    Properties:
+      ServiceToken: !GetAtt CustomResourceFunction.Arn
+      ClusterId: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: EC2
+
+
+
+
+  CustomResourceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: 'customresource'
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ecs:DescribeTasks'
+            - 'ecs:RunTask'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'iam:PassRole'
+            Resource: '*' 
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'            
+
+
+  ECSAutoScalingGroup:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchConfigurationName: !Ref ECSLaunchConfiguration
+      MinSize: !Ref ClusterSize
+      MaxSize: !Ref ClusterSize
+      DesiredCapacity: !Ref ClusterSize
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} ECS host
+          PropagateAtLaunch: true
+
+
+  ECSLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref ECSAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      SecurityGroups:
+        - !Ref SecurityGroup
+      IamInstanceProfile: !Ref ECSInstanceProfile
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub ${EnvironmentName}-ECSRole
+      AssumeRolePolicyDocument: |
+        {
+          "Version": "2008-10-17",
+          "Statement": [
+            {
+              "Sid": "",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument: |
+            {
+                "Statement": [{
+                    "Effect": "Allow",   
+                    "Action": [
+                        "ecs:CreateCluster",
+                        "ecs:DeregisterContainerInstance",
+                        "ecs:DiscoverPollEndpoint",
+                        "ecs:Poll",  
+                        "ecs:RegisterContainerInstance",
+                        "ecs:StartTelemetrySession",
+                        "ecs:Submit*"                        
+                    ],
+                    "Resource": "*"
+                }]
+            }
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSRole
+
+         
+
+ 
+
+
+
+
+
+# #   # Service:
+# #   #   Type: AWS::ECS::Service
+# #   #   Properties:
+# #   #     ServiceName: !Sub ${EnvironmentName}-service
+# #   #     Cluster: !Ref ECSCluster
+# #   #     DesiredCount: 1
+# #   #     TaskDefinition: !Ref TaskDefinition
+
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ismaeelwpfamily
+      Cpu:  1 vCPU
+      Memory: 512
+      NetworkMode: bridge      
+      # TaskRoleArn: !Ref Taskrole
+      ExecutionRoleArn: !Ref ExecutionRole
+      ContainerDefinitions:
+        - Name: wordpress
+          PortMappings: 
+            - 
+              ContainerPort: 80
+              HostPort: 8080
+              Protocol: tcp 
+          environment: 
+            - 
+              name: WORDPRESS_DB_HOST
+              value: mysql:3306
+            -  
+              name: WORDPRESS_DB_PASSWORD
+              value: wordpress
+            - 
+              name: WORDPRESS_DB_USER
+              value: wordpress
+            - 
+              name: WORDPRESS_DB_NAME
+              value: wordpress
+
+          Image: wordpress:latest
+          Links:
+            - mysql
+
+
+        - Name: mysql
+          environment: 
+            - 
+              name: MYSQL_PASSWORD
+              value: wordpress 
+            -
+              name: MYSQL_USER
+              value: wordpress 
+            - 
+              name: MYSQL_DATABASE
+              value: wordpress
+            - 
+              name: MYSQL_ROOT_PASSWORD
+              value: Password1234        
+
+          Image: mysql:5.7
+
+
+# The Amazon ECS Task Role trust relationship is shown below.
+# Trust Policies
+#  how Cloud security architects and account administrators can protect IAM roles from misuse by using trust policies.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+# role assign to container task  in ECS   
+    Properties:
+      RoleName: wpservices31-ismaeel-task
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
